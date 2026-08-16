@@ -1,16 +1,8 @@
 # oc-tps
 
-Displays live TPS (tokens per second), average TPS, and average TTFT (time to first token) in the OpenCode session prompt.
+OpenCode 2 TUI plugin that displays live TPS, average TPS, and average time to first token in the session prompt.
 
 
 ![Demo](./assets/demo.gif)
 
-## Installation
-
-Install from the CLI:
-
-```bash
-opencode plugin oc-tps@latest --global
-```
-
-Requires `opencode` `1.3.14` or newer.
+Add it to the `plugins` array in OpenCode 2's `cli.json`.

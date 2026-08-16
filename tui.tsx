@@ -1,22 +1,16 @@
 /** @jsxImportSource @opentui/solid */
-import type { TextRenderable } from "@opentui/core"
-import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { onCleanup } from "solid-js"
+import { Plugin } from "@opencode-ai/plugin/tui"
+import { createMemo, createSignal, type Accessor } from "solid-js"
 
 type StreamSample = {
   at: number
   tokens: number
 }
 
-const STREAM_WINDOW_MS = 5_000
-const LIVE_STALE_MS = 1_500
-const SINGLE_SAMPLE_MS = 1_000
-type MessageTiming = {
+type StepTiming = {
   sessionID: string
   requestStartAt: number
   firstResponseAt?: number
-  firstTokenAt?: number
-  lastTokenAt?: number
   lastToolCallAt?: number
 }
 
@@ -24,26 +18,29 @@ type SessionAverage = {
   totalTokens: number
   totalDurationMs: number
   totalTtftMs: number
-  messageCount: number
+  stepCount: number
 }
 
-type TrackerState = {
-  streamSamplesBySession: Record<string, StreamSample[]>
-  messageTimingByID: Record<string, MessageTiming>
-  sessionAverageByID: Record<string, SessionAverage>
+type Tracker = {
+  samples: Record<string, StreamSample[]>
+  requestStarts: Record<string, number>
+  timings: Record<string, StepTiming>
+  averages: Record<string, SessionAverage>
 }
 
-type TrackerListener = () => void
+const STREAM_WINDOW_MS = 5_000
+const LIVE_STALE_MS = 1_500
+const SINGLE_SAMPLE_MS = 1_000
 
-function estimateStreamTokens(delta: string) {
+function estimateTokens(delta: string) {
   return Math.max(1, Math.ceil(Buffer.byteLength(delta, "utf8") / 5))
 }
 
-function formatRate(value: number, label: "TPS" | "AVG") {
+function formatRate(value: number) {
   if (!Number.isFinite(value) || value <= 0) return undefined
-  if (value >= 100) return `${Math.round(value)}${label === "TPS" ? " TPS" : ""}`
-  if (value >= 10) return `${value.toFixed(1)}${label === "TPS" ? " TPS" : ""}`
-  return `${value.toFixed(2)}${label === "TPS" ? " TPS" : ""}`
+  if (value >= 100) return Math.round(value).toString()
+  if (value >= 10) return value.toFixed(1)
+  return value.toFixed(2)
 }
 
 function formatTtft(value: number) {
@@ -51,7 +48,7 @@ function formatTtft(value: number) {
   return `${value.toFixed(1)}s`
 }
 
-function activeDurationMs(samples: StreamSample[], tailAt?: number) {
+function activeDuration(samples: StreamSample[], tailAt?: number) {
   if (samples.length === 0) return 0
   if (samples.length === 1) {
     const tailDuration = tailAt ? Math.max(0, tailAt - samples[0].at) : SINGLE_SAMPLE_MS
@@ -62,248 +59,176 @@ function activeDurationMs(samples: StreamSample[], tailAt?: number) {
   for (let i = 1; i < samples.length; i++) {
     duration += Math.max(0, samples[i].at - samples[i - 1].at)
   }
-
-  if (tailAt) {
-    duration += Math.max(0, tailAt - samples[samples.length - 1].at)
-  }
-
+  if (tailAt) duration += Math.max(0, tailAt - samples[samples.length - 1].at)
   return Math.max(duration, SINGLE_SAMPLE_MS)
 }
 
-function SessionPromptRight(props: {
-  api: Parameters<TuiPlugin>[0]
+function Status(props: {
+  context: Plugin.Context
   sessionID: string
-  tracker: TrackerState
-  subscribe: (listener: TrackerListener) => () => void
+  tracker: Tracker
+  revision: Accessor<number>
 }) {
-  let text: TextRenderable | undefined
+  const content = createMemo(() => {
+    props.revision()
+    const totals = props.tracker.averages[props.sessionID]
+    const average = totals
+      ? formatRate(totals.totalTokens / (totals.totalDurationMs / 1_000))
+      : undefined
+    const ttft = totals?.stepCount
+      ? formatTtft(totals.totalTtftMs / totals.stepCount / 1_000)
+      : undefined
 
-  const sync = () => {
-    if (!text) return
-    text.content = statusText()
-    props.api.renderer.requestRender()
-  }
+    let live: string | undefined
+    if (props.context.data.session.status(props.sessionID) === "running") {
+      const now = Date.now()
+      const samples = (props.tracker.samples[props.sessionID] ?? []).filter(
+        (sample) => now - sample.at <= STREAM_WINDOW_MS,
+      )
+      const last = samples[samples.length - 1]
+      if (last && now - last.at <= LIVE_STALE_MS) {
+        const tokens = samples.reduce((sum, sample) => sum + sample.tokens, 0)
+        live = formatRate(tokens / (activeDuration(samples, now) / 1_000))
+      }
+    }
 
-  const unsubscribe = props.subscribe(sync)
-  onCleanup(unsubscribe)
+    return `TPS ${live ?? "-"} | AVG ${average ?? "-"} | TTFT ${ttft ?? "-"}`
+  })
 
   return (
-    <text
-      ref={(ref: TextRenderable) => {
-        text = ref
-        sync()
-      }}
-      fg={props.api.theme.current.textMuted}
-    >
-      {statusText()}
-    </text>
+    <box position="absolute" right={2} bottom={2} height={1} flexDirection="row">
+      <text fg={props.context.theme.text.subdued} flexShrink={0}>
+        {content()}
+      </text>
+    </box>
   )
-
-  function sessionAverage() {
-    const totals = props.tracker.sessionAverageByID[props.sessionID]
-    if (!totals || totals.totalTokens <= 0 || totals.totalDurationMs <= 0) return undefined
-    return formatRate(totals.totalTokens / (totals.totalDurationMs / 1000), "AVG")
-  }
-
-  function sessionTtft() {
-    const totals = props.tracker.sessionAverageByID[props.sessionID]
-    if (!totals || totals.messageCount <= 0 || totals.totalTtftMs < 0) return undefined
-    return formatTtft(totals.totalTtftMs / totals.messageCount / 1000)
-  }
-
-  function liveTps() {
-    const status = props.api.state.session.status(props.sessionID)
-    if (status?.type === "idle") return undefined
-    const samples = props.tracker.streamSamplesBySession[props.sessionID] ?? []
-    if (samples.length === 0) return undefined
-    const now = Date.now()
-    const relevant = samples.filter((sample) => now - sample.at <= STREAM_WINDOW_MS)
-    if (relevant.length === 0) return undefined
-    const lastSample = relevant[relevant.length - 1]
-    if (!lastSample || now - lastSample.at > LIVE_STALE_MS) return undefined
-    const total = relevant.reduce((sum, sample) => sum + sample.tokens, 0)
-    const durationSeconds = activeDurationMs(relevant, now) / 1000
-    if (durationSeconds <= 0) return undefined
-    return formatRate(total / durationSeconds, "TPS")
-  }
-
-  function statusText() {
-    const live = liveTps() ?? "-"
-    const avg = sessionAverage() ?? "-"
-    const ttft = sessionTtft() ?? "-"
-    return `TPS ${live} | AVG ${avg} | TTFT ${ttft}`
-  }
 }
 
-const tui: TuiPlugin = async (api) => {
-  const tracker: TrackerState = {
-    streamSamplesBySession: {},
-    messageTimingByID: {},
-    sessionAverageByID: {},
-  }
-  const listeners = new Set<TrackerListener>()
-
-  const bump = () => {
-    for (const listener of listeners) listener()
-  }
-
-  const pruneSamples = (now = Date.now()) => {
-    let changed = false
-
-    for (const [sessionID, samples] of Object.entries(tracker.streamSamplesBySession)) {
-      const next = samples.filter((sample) => now - sample.at <= STREAM_WINDOW_MS)
-      if (next.length !== samples.length) {
-        changed = true
-        if (next.length > 0) tracker.streamSamplesBySession[sessionID] = next
-        else delete tracker.streamSamplesBySession[sessionID]
-      }
-    }
-
-    if (changed) bump()
-  }
-
-  const clearLiveSamples = (sessionID: string) => {
-    if (!tracker.streamSamplesBySession[sessionID]?.length) return
-    delete tracker.streamSamplesBySession[sessionID]
-    bump()
-  }
-
-  const appendSample = (sessionID: string, messageID: string, sample: StreamSample) => {
-    const now = sample.at
-    tracker.streamSamplesBySession[sessionID] = [
-      ...(tracker.streamSamplesBySession[sessionID] ?? []).filter((item) => now - item.at <= STREAM_WINDOW_MS),
-      sample,
-    ]
-    const timing = tracker.messageTimingByID[messageID]
-    if (timing) {
-      tracker.messageTimingByID[messageID] = timing.firstTokenAt
-        ? { ...timing, lastTokenAt: now }
-        : {
-            ...timing,
-            firstResponseAt: timing.firstResponseAt ?? now,
-            firstTokenAt: now,
-            lastTokenAt: now,
-          }
-    }
-    bump()
-  }
-
-  const onDelta = api.event.on("message.part.delta", (evt) => {
-    if (evt.properties.field !== "text") return
-    const parts = api.state.part(evt.properties.messageID)
-    const part = parts.find((item) => item.id === evt.properties.partID)
-    if (!part) return
-    if (part.type !== "text" && part.type !== "reasoning") return
-    appendSample(evt.properties.sessionID, evt.properties.messageID, {
-      at: Date.now(),
-      tokens: estimateStreamTokens(evt.properties.delta),
-    })
-  })
-
-  const onMessage = api.event.on("message.updated", (evt) => {
-    if (evt.properties.info.role !== "assistant") return
-    const sessionID = evt.properties.info.sessionID ?? evt.properties.sessionID
-
-    if (!evt.properties.info.time.completed) {
-      const existing = tracker.messageTimingByID[evt.properties.info.id]
-      tracker.messageTimingByID[evt.properties.info.id] = {
-        sessionID,
-        requestStartAt: evt.properties.info.time.created,
-        firstResponseAt: existing?.firstResponseAt,
-        firstTokenAt: existing?.firstTokenAt,
-        lastTokenAt: existing?.lastTokenAt,
-        lastToolCallAt: existing?.lastToolCallAt,
-      }
-      bump()
-      return
-    }
-
-    const timing = tracker.messageTimingByID[evt.properties.info.id]
-    if (timing?.sessionID === sessionID && typeof timing.firstResponseAt === "number") {
-      const totalTokens = evt.properties.info.tokens.output + evt.properties.info.tokens.reasoning
-      const endAt =
-        evt.properties.info.finish === "tool-calls"
-          ? timing.lastToolCallAt
-          : evt.properties.info.time.completed
-      const durationMs = typeof endAt === "number" ? Math.max(endAt - timing.firstResponseAt, 1) : undefined
-      const ttftMs = Math.max(timing.firstResponseAt - timing.requestStartAt, 0)
-      if (totalTokens > 0 && durationMs) {
-        const totals = tracker.sessionAverageByID[sessionID] ?? {
-          totalTokens: 0,
-          totalDurationMs: 0,
-          totalTtftMs: 0,
-          messageCount: 0,
-        }
-        tracker.sessionAverageByID[sessionID] = {
-          totalTokens: totals.totalTokens + totalTokens,
-          totalDurationMs: totals.totalDurationMs + durationMs,
-          totalTtftMs: totals.totalTtftMs + ttftMs,
-          messageCount: totals.messageCount + 1,
-        }
-      }
-    }
-    delete tracker.messageTimingByID[evt.properties.info.id]
-    pruneSamples(evt.properties.info.time.completed)
-    bump()
-  })
-
-  const onPart = api.event.on("message.part.updated", (evt) => {
-    if (evt.properties.part.type !== "tool") return
-    const sessionID = evt.properties.part.sessionID ?? evt.properties.sessionID
-    if (
-      evt.properties.part.state.status === "running" ||
-      evt.properties.part.state.status === "completed" ||
-      evt.properties.part.state.status === "error"
-    ) {
-      clearLiveSamples(sessionID)
-    }
-    const timing = tracker.messageTimingByID[evt.properties.part.messageID]
-    if (!timing) return
-    if (evt.properties.part.state.status === "pending") {
-      tracker.messageTimingByID[evt.properties.part.messageID] = {
-        ...timing,
-        firstResponseAt: timing.firstResponseAt ?? evt.properties.time,
-      }
-      bump()
-      return
-    }
-    if (evt.properties.part.state.status !== "running") return
-    tracker.messageTimingByID[evt.properties.part.messageID] = {
-      ...timing,
-      lastToolCallAt: evt.properties.part.state.time.start,
-    }
-    bump()
-  })
-
-  const timer = setInterval(() => {
-    pruneSamples()
-    bump()
-  }, 1000)
-
-  api.lifecycle.onDispose(() => {
-    onDelta()
-    onMessage()
-    onPart()
-    clearInterval(timer)
-  })
-
-  api.slots.register({
-    slots: {
-      session_prompt_right(_ctx, value) {
-        return <SessionPromptRight api={api} sessionID={value.session_id} tracker={tracker} subscribe={(listener) => {
-          listeners.add(listener)
-          return () => {
-            listeners.delete(listener)
-          }
-        }} />
-      },
-    },
-  })
-}
-
-const plugin: TuiPluginModule & { id: string } = {
+export default Plugin.define({
   id: "oc-tps",
-  tui,
-}
+  setup(context) {
+    const tracker: Tracker = {
+      samples: {},
+      requestStarts: {},
+      timings: {},
+      averages: {},
+    }
+    const [revision, setRevision] = createSignal(0)
+    const bump = () => setRevision((value) => value + 1)
 
-export default plugin
+    const clearLive = (sessionID: string) => {
+      if (!tracker.samples[sessionID]) return
+      delete tracker.samples[sessionID]
+      bump()
+    }
+
+    const appendSample = (sessionID: string, messageID: string, delta: string) => {
+      const now = Date.now()
+      tracker.samples[sessionID] = [
+        ...(tracker.samples[sessionID] ?? []).filter((sample) => now - sample.at <= STREAM_WINDOW_MS),
+        { at: now, tokens: estimateTokens(delta) },
+      ]
+      const timing = tracker.timings[messageID]
+      if (timing && timing.firstResponseAt === undefined) timing.firstResponseAt = now
+      bump()
+    }
+
+    const subscriptions = [
+      context.data.on("session.execution.started", (event) => {
+        tracker.requestStarts[event.data.sessionID] = event.created
+      }),
+      context.data.on("session.step.started", (event) => {
+        tracker.timings[event.data.assistantMessageID] = {
+          sessionID: event.data.sessionID,
+          requestStartAt: tracker.requestStarts[event.data.sessionID] ?? event.created,
+        }
+        delete tracker.requestStarts[event.data.sessionID]
+        bump()
+      }),
+      context.data.on("session.text.delta", (event) => {
+        appendSample(event.data.sessionID, event.data.assistantMessageID, event.data.delta)
+      }),
+      context.data.on("session.reasoning.delta", (event) => {
+        appendSample(event.data.sessionID, event.data.assistantMessageID, event.data.delta)
+      }),
+      context.data.on("session.tool.input.started", (event) => {
+        clearLive(event.data.sessionID)
+        const timing = tracker.timings[event.data.assistantMessageID]
+        if (!timing) return
+        timing.firstResponseAt ??= event.created
+        bump()
+      }),
+      context.data.on("session.tool.called", (event) => {
+        const timing = tracker.timings[event.data.assistantMessageID]
+        if (!timing) return
+        timing.lastToolCallAt = event.created
+        bump()
+      }),
+      context.data.on("session.step.ended", (event) => {
+        const timing = tracker.timings[event.data.assistantMessageID]
+        if (timing?.firstResponseAt !== undefined) {
+          const tokens = event.data.tokens.output + event.data.tokens.reasoning
+          const endAt = event.data.finish === "tool-calls" ? timing.lastToolCallAt ?? event.created : event.created
+          const duration = Math.max(endAt - timing.firstResponseAt, 1)
+          if (tokens > 0) {
+            const totals = tracker.averages[event.data.sessionID] ?? {
+              totalTokens: 0,
+              totalDurationMs: 0,
+              totalTtftMs: 0,
+              stepCount: 0,
+            }
+            tracker.averages[event.data.sessionID] = {
+              totalTokens: totals.totalTokens + tokens,
+              totalDurationMs: totals.totalDurationMs + duration,
+              totalTtftMs: totals.totalTtftMs + Math.max(timing.firstResponseAt - timing.requestStartAt, 0),
+              stepCount: totals.stepCount + 1,
+            }
+          }
+        }
+        delete tracker.timings[event.data.assistantMessageID]
+        bump()
+      }),
+      context.data.on("session.step.failed", (event) => {
+        delete tracker.timings[event.data.assistantMessageID]
+        clearLive(event.data.sessionID)
+        bump()
+      }),
+    ]
+
+    for (const type of [
+      "session.execution.succeeded",
+      "session.execution.failed",
+      "session.execution.interrupted",
+    ] as const) {
+      subscriptions.push(
+        context.data.on(type, (event) => {
+          delete tracker.requestStarts[event.data.sessionID]
+          clearLive(event.data.sessionID)
+        }),
+      )
+    }
+
+    const timer = setInterval(() => {
+      const now = Date.now()
+      for (const [sessionID, samples] of Object.entries(tracker.samples)) {
+        const current = samples.filter((sample) => now - sample.at <= STREAM_WINDOW_MS)
+        if (current.length) tracker.samples[sessionID] = current
+        else delete tracker.samples[sessionID]
+      }
+      bump()
+    }, 1_000)
+
+    context.ui.slot({
+      append: "prompt.footer",
+      render: (props) => {
+        if (!props.sessionID || props.mode !== "normal") return null
+        return <Status context={context} sessionID={props.sessionID} tracker={tracker} revision={revision} />
+      },
+    })
+
+    return () => {
+      subscriptions.forEach((unsubscribe) => unsubscribe())
+      clearInterval(timer)
+    }
+  },
+})
