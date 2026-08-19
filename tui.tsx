@@ -122,14 +122,13 @@ export default Plugin.define({
       bump()
     }
 
-    const appendSample = (sessionID: string, messageID: string, delta: string) => {
-      const now = Date.now()
+    const appendSample = (sessionID: string, messageID: string, delta: string, at: number) => {
       tracker.samples[sessionID] = [
-        ...(tracker.samples[sessionID] ?? []).filter((sample) => now - sample.at <= STREAM_WINDOW_MS),
-        { at: now, tokens: estimateTokens(delta) },
+        ...(tracker.samples[sessionID] ?? []).filter((sample) => at - sample.at <= STREAM_WINDOW_MS),
+        { at, tokens: estimateTokens(delta) },
       ]
       const timing = tracker.timings[messageID]
-      if (timing && timing.firstResponseAt === undefined) timing.firstResponseAt = now
+      if (timing && timing.firstResponseAt === undefined) timing.firstResponseAt = at
       bump()
     }
 
@@ -146,10 +145,10 @@ export default Plugin.define({
         bump()
       }),
       context.data.on("session.text.delta", (event) => {
-        appendSample(event.data.sessionID, event.data.assistantMessageID, event.data.delta)
+        appendSample(event.data.sessionID, event.data.assistantMessageID, event.data.delta, event.created)
       }),
       context.data.on("session.reasoning.delta", (event) => {
-        appendSample(event.data.sessionID, event.data.assistantMessageID, event.data.delta)
+        appendSample(event.data.sessionID, event.data.assistantMessageID, event.data.delta, event.created)
       }),
       context.data.on("session.tool.input.started", (event) => {
         clearLive(event.data.sessionID)
