@@ -39,11 +39,11 @@ function estimateStreamTokens(delta: string) {
   return Math.max(1, Math.ceil(Buffer.byteLength(delta, "utf8") / 5))
 }
 
-function formatRate(value: number, label: "TPS" | "AVG") {
+function formatRate(value: number) {
   if (!Number.isFinite(value) || value <= 0) return undefined
-  if (value >= 100) return `${Math.round(value)}${label === "TPS" ? " TPS" : ""}`
-  if (value >= 10) return `${value.toFixed(1)}${label === "TPS" ? " TPS" : ""}`
-  return `${value.toFixed(2)}${label === "TPS" ? " TPS" : ""}`
+  if (value >= 100) return `${Math.round(value)}`
+  if (value >= 10) return `${value.toFixed(1)}`
+  return `${value.toFixed(2)}`
 }
 
 function formatTtft(value: number) {
@@ -102,7 +102,7 @@ function SessionPromptRight(props: {
   function sessionAverage() {
     const totals = props.tracker.sessionAverageByID[props.sessionID]
     if (!totals || totals.totalTokens <= 0 || totals.totalDurationMs <= 0) return undefined
-    return formatRate(totals.totalTokens / (totals.totalDurationMs / 1000), "AVG")
+    return formatRate(totals.totalTokens / (totals.totalDurationMs / 1000))
   }
 
   function sessionTtft() {
@@ -124,7 +124,7 @@ function SessionPromptRight(props: {
     const total = relevant.reduce((sum, sample) => sum + sample.tokens, 0)
     const durationSeconds = activeDurationMs(relevant, now) / 1000
     if (durationSeconds <= 0) return undefined
-    return formatRate(total / durationSeconds, "TPS")
+    return formatRate(total / durationSeconds)
   }
 
   function statusText() {
