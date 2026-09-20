@@ -97,7 +97,7 @@ function Status(props: {
 
   return (
     <box position="absolute" right={2} bottom={2} height={1} flexDirection="row">
-      <text fg={props.context.theme.text.subdued} flexShrink={0}>
+      <text fg={props.context.theme.text.muted} flexShrink={0}>
         {content()}
       </text>
     </box>
