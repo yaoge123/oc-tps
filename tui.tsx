@@ -133,11 +133,19 @@ function readTokensPerChar(value: unknown): Record<StreamKind, number> {
 
 function readOptions(raw: unknown): Options {
   const source = (raw ?? {}) as Record<string, unknown>
+  const windowMs = boundedNumber(source.windowMs, DEFAULTS.windowMs, 100, 30_000)
+  // A minimum span larger than the window can never be reached, and a
+  // non-positive one would divide by a zero span, so it is clamped into the
+  // window and kept above zero.
+  const minWindowMs = Math.max(
+    1,
+    Math.min(boundedNumber(source.minWindowMs, DEFAULTS.minWindowMs, 1, 30_000), windowMs),
+  )
   return {
-    windowMs: boundedNumber(source.windowMs, DEFAULTS.windowMs, 100, 30_000),
+    windowMs,
     liveStaleMs: boundedNumber(source.liveStaleMs, DEFAULTS.liveStaleMs, 100, 30_000),
     minSamples: Math.round(boundedNumber(source.minSamples, DEFAULTS.minSamples, 1, 1_000)),
-    minWindowMs: boundedNumber(source.minWindowMs, DEFAULTS.minWindowMs, 0, 30_000),
+    minWindowMs,
     calibrationAlpha: boundedNumber(source.calibrationAlpha, DEFAULTS.calibrationAlpha, 0.01, 1),
     liveSmoothing: boundedNumber(source.liveSmoothing, DEFAULTS.liveSmoothing, 0, 1),
     tickMs: boundedNumber(source.tickMs, DEFAULTS.tickMs, 50, 10_000),
@@ -294,13 +302,25 @@ export default Plugin.define({
     // turn never sends step.ended - and the per-message entries are keyed by
     // message id rather than by session, so they have to be swept by hand or
     // they outlive the turn that created them.
-    const clearSession = (sessionID: string) => {
+    const dropMessage = (messageID: string) => {
+      delete tracker.timings[messageID]
+      delete tracker.chars[messageID]
+      delete tracker.streams[messageID]
+    }
+
+    // Deltas occasionally arrive under a different message id than the one the
+    // step boundary reports, so a step can leave entries behind that no
+    // boundary will ever claim. Each step sweeps its session, and so does the
+    // end of the execution.
+    const dropSessionMessages = (sessionID: string, keep?: string) => {
       for (const [messageID, timing] of Object.entries(tracker.timings)) {
-        if (timing.sessionID !== sessionID) continue
-        delete tracker.timings[messageID]
-        delete tracker.chars[messageID]
-        delete tracker.streams[messageID]
+        if (timing.sessionID !== sessionID || messageID === keep) continue
+        dropMessage(messageID)
       }
+    }
+
+    const clearSession = (sessionID: string) => {
+      dropSessionMessages(sessionID)
       delete tracker.samples[sessionID]
       delete tracker.live[sessionID]
       delete tracker.pendingChars[sessionID]
@@ -407,17 +427,19 @@ export default Plugin.define({
         // instead of calibrating against zero.
         const chars = tracker.chars[messageID] ?? tracker.pendingChars[sessionID] ?? emptyChars()
         const model = timing?.model ?? tracker.modelBySession[sessionID] ?? UNKNOWN_MODEL
+        // A tool call reports its arguments as output tokens but never streams
+        // them as text, so its step is kept out of the text stream entirely.
+        const toolCall = event.data.finish === "tool-calls"
 
         if (timing?.firstResponseAt !== undefined) {
-          const endAt =
-            event.data.finish === "tool-calls" ? timing.lastToolCallAt ?? event.created : event.created
+          const endAt = toolCall ? timing.lastToolCallAt ?? event.created : event.created
           const duration = Math.max(endAt - timing.firstResponseAt, 1)
           if (tokens > 0) {
             const spans = tracker.streams[messageID] ?? {}
             const reasoningSpan = spanMs(spans.reasoning)
             const textSpan = spanMs(spans.text)
             const reasoningMs = reasoningSpan >= MIN_STREAM_SPAN_MS ? reasoningSpan : 0
-            const textMs = textSpan >= MIN_STREAM_SPAN_MS ? textSpan : 0
+            const textMs = !toolCall && textSpan >= MIN_STREAM_SPAN_MS ? textSpan : 0
             const totals = tracker.averages[sessionID] ?? {
               totalTokens: 0,
               totalReasoningTokens: 0,
@@ -446,18 +468,17 @@ export default Plugin.define({
         // Each stream only learns from the tokens it produced itself, so a step
         // that is pure reasoning cannot drag the text ratio around.
         learn(model, "reasoning", reasoningTokens, chars.reasoning)
-        learn(model, "text", outputTokens, chars.text)
+        // Same reasoning as above: a tool call would add its arguments to the
+        // numerator without adding a single text character.
+        if (!toolCall) learn(model, "text", outputTokens, chars.text)
 
-        delete tracker.timings[messageID]
-        delete tracker.chars[messageID]
+        dropMessage(messageID)
+        dropSessionMessages(sessionID)
         delete tracker.pendingChars[sessionID]
-        delete tracker.streams[messageID]
         bump()
       }),
       context.data.on("session.step.failed", (event) => {
-        delete tracker.timings[event.data.assistantMessageID]
-        delete tracker.chars[event.data.assistantMessageID]
-        delete tracker.streams[event.data.assistantMessageID]
+        dropMessage(event.data.assistantMessageID)
         clearSession(event.data.sessionID)
         bump()
       }),
