@@ -54,9 +54,15 @@ test("stream events update live TPS, averages, and TTFT without remounting", asy
   const now = Date.now()
   f.emit("session.execution.started", now - 1500)
   f.emit("session.step.started", now - 1500)
+  // One delta is below the sampling threshold, so there is no rate yet.
   f.emit("session.text.delta", now - 1000, { delta: "x".repeat(50) })
   await f.renderOnce()
-  expect(f.captureCharFrame()).toContain("TPS 10.0")
+  expect(f.captureCharFrame()).toContain("TPS - | AVG - | TTFT -")
+  // Two deltas 500 ms apart: 50 chars + 25 chars at 0.5 tokens/char over
+  // 0.5 s is 75 tok/s.
+  f.emit("session.text.delta", now - 500, { delta: "x".repeat(25) })
+  await f.renderOnce()
+  expect(f.captureCharFrame()).toContain("TPS 75.0")
   f.emit("session.step.ended", now, { tokens: { output: 20, reasoning: 0 }, finish: "stop" })
   await f.renderOnce()
   expect(f.captureCharFrame()).toContain("AVG 20.0 | TTFT 0.5s")
